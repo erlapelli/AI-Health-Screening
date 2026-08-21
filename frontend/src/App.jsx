@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import "./App.css";
 const API_URL = import.meta.env.VITE_API_URL;
-const WS_URL = import.meta.env.VITE_WS_URL;
+const WS_URL = API_URL.replace(/^http/, "ws");
 
 function App() {
   const [screen, setScreen] = useState("welcome");
