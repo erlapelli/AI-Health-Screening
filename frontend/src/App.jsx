@@ -5,6 +5,7 @@ function App() {
   const [screen, setScreen] = useState("welcome");
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [socket, setSocket] = useState(null);
 
   const [transcript, setTranscript] = useState("");
   const [aiResponse, setAiResponse] = useState("");
@@ -14,7 +15,16 @@ function App() {
   const [error, setError] = useState("");
 
   const mediaRecorderRef = useRef(null);
+
+  // Audio chunks sent from browser to backend
   const audioChunksRef = useRef([]);
+
+  // Audio chunks received from AI through WebSocket
+  const incomingAudioChunksRef = useRef([]);
+
+  // ==========================================
+  // START RECORDING
+  // ==========================================
 
   const startRecording = async () => {
     try {
@@ -22,447 +32,875 @@ function App() {
       setTranscript("");
       setAiResponse("");
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-      });
+      if (
+        !socket ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
+        setError(
+          "Realtime connection is not ready."
+        );
+        return;
+      }
 
-      const mediaRecorder = new MediaRecorder(stream);
-
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, {
-          type: "audio/webm",
+      const stream =
+        await navigator.mediaDevices.getUserMedia({
+          audio: true,
         });
 
-        stream.getTracks().forEach((track) => track.stop());
+      const mediaRecorder =
+        new MediaRecorder(stream);
 
-        await processAudio(audioBlob);
+      mediaRecorderRef.current =
+        mediaRecorder;
+
+      audioChunksRef.current = [];
+
+      // --------------------------------
+      // SEND AUDIO CHUNKS THROUGH WEBSOCKET
+      // --------------------------------
+
+      mediaRecorder.ondataavailable = (
+        event
+      ) => {
+        if (
+          event.data.size > 0 &&
+          socket.readyState === WebSocket.OPEN
+        ) {
+          socket.send(event.data);
+        }
       };
 
-      mediaRecorder.start();
+      // --------------------------------
+      // RECORDING STOPPED
+      // --------------------------------
+
+      mediaRecorder.onstop = () => {
+        stream
+          .getTracks()
+          .forEach((track) =>
+            track.stop()
+          );
+
+        if (
+          socket.readyState === WebSocket.OPEN
+        ) {
+          socket.send(
+            JSON.stringify({
+              type: "audio_end",
+            })
+          );
+        }
+
+        console.log(
+          "Audio turn sent to backend"
+        );
+
+        setIsRecording(false);
+        setIsProcessing(true);
+      };
+
+      // Send audio chunks every 250ms
+      mediaRecorder.start(250);
 
       setIsRecording(true);
+
+      console.log(
+        "Recording started"
+      );
+
     } catch (error) {
-      console.error("Microphone error:", error);
-      setError("Could not access microphone.");
+      console.error(
+        "Microphone error:",
+        error
+      );
+
+      setError(
+        "Could not access microphone."
+      );
     }
   };
+
+
+  // ==========================================
+  // DONE SPEAKING
+  // ==========================================
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current) {
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !==
+        "inactive"
+    ) {
       mediaRecorderRef.current.stop();
-      setIsRecording(false);
+
+      mediaRecorderRef.current = null;
+
+      console.log(
+        "User finished speaking"
+      );
     }
   };
 
-  const processAudio = async (audioBlob) => {
-    try {
-      setIsProcessing(true);
-      setError("");
 
-      // --------------------------------
-      // STEP 1: Speech → Text
-      // --------------------------------
+  // ==========================================
+  // CONNECT WEBSOCKET
+  // ==========================================
 
-      const formData = new FormData();
+  const connectWebSocket = (callId) => {
+    const ws = new WebSocket(
+      `ws://localhost:5000/ws?callId=${callId}`
+    );
 
-      formData.append("audio", audioBlob, "recording.webm");
+    // --------------------------------
+    // CONNECTION OPEN
+    // --------------------------------
 
-      const transcriptionResponse = await fetch(
-        "http://localhost:5000/api/transcribe",
-        {
-          method: "POST",
-          body: formData,
-        }
+    ws.onopen = () => {
+      console.log(
+        "WebSocket connected"
       );
 
-      const transcriptionData = await transcriptionResponse.json();
+      setSocket(ws);
+    };
 
-      if (!transcriptionResponse.ok) {
-        throw new Error(
-          transcriptionData.error || "Transcription failed"
+
+    // --------------------------------
+    // RECEIVE MESSAGE
+    // --------------------------------
+
+    ws.onmessage = async (event) => {
+
+      // ==================================
+      // BINARY AUDIO FROM AI
+      // ==================================
+
+      if (
+        event.data instanceof Blob
+      ) {
+        console.log(
+          "AI audio chunk received:",
+          event.data.size,
+          "bytes"
+        );
+
+        incomingAudioChunksRef.current.push(
+          event.data
+        );
+
+        return;
+      }
+
+
+      // ==================================
+      // JSON MESSAGE
+      // ==================================
+
+      try {
+        const data = JSON.parse(
+          event.data
+        );
+
+        console.log(
+          "WebSocket message:",
+          data
+        );
+
+
+        // --------------------------------
+        // CONNECTION CONFIRMED
+        // --------------------------------
+
+        if (
+          data.type === "connected"
+        ) {
+          console.log(
+            "Realtime connection established"
+          );
+        }
+
+
+        // --------------------------------
+        // USER TRANSCRIPT
+        // --------------------------------
+
+        if (
+          data.type === "transcript"
+        ) {
+          setTranscript(
+            data.text
+          );
+        }
+
+
+        // --------------------------------
+        // AI TEXT RESPONSE
+        // --------------------------------
+
+        if (
+          data.type === "assistant_text"
+        ) {
+          setAiResponse(
+            data.text
+          );
+
+          setIsProcessing(true);
+        }
+
+
+        // --------------------------------
+        // AI AUDIO START
+        // --------------------------------
+
+        if (
+          data.type === "audio_start"
+        ) {
+          console.log(
+            "AI audio started"
+          );
+
+          incomingAudioChunksRef.current =
+            [];
+        }
+
+
+        // --------------------------------
+        // AI AUDIO END
+        // --------------------------------
+
+        if (
+          data.type === "audio_end"
+        ) {
+          console.log(
+            "AI audio finished"
+          );
+
+          const audioBlob =
+            new Blob(
+              incomingAudioChunksRef.current,
+              {
+                type: "audio/mpeg",
+              }
+            );
+
+          console.log(
+            "Final AI audio:",
+            audioBlob.size,
+            "bytes"
+          );
+
+          incomingAudioChunksRef.current =
+            [];
+
+          const audioUrl =
+            URL.createObjectURL(
+              audioBlob
+            );
+
+          const audio =
+            new Audio(audioUrl);
+
+          audio.onended = () => {
+            URL.revokeObjectURL(
+              audioUrl
+            );
+
+            setIsProcessing(false);
+
+            console.log(
+              "AI finished speaking"
+            );
+          };
+
+          try {
+            await audio.play();
+
+            console.log(
+              "AI audio playback started"
+            );
+
+          } catch (error) {
+            console.error(
+              "Audio playback error:",
+              error
+            );
+
+            setIsProcessing(false);
+
+            setError(
+              "Could not play AI audio."
+            );
+          }
+        }
+
+
+        // --------------------------------
+        // WEBSOCKET ERROR MESSAGE
+        // --------------------------------
+
+        if (
+          data.type === "error"
+        ) {
+          setIsProcessing(false);
+
+          setError(
+            data.message
+          );
+        }
+
+      } catch (error) {
+        console.error(
+          "WebSocket message error:",
+          error
         );
       }
+    };
 
-      const userText = transcriptionData.text;
 
-      setTranscript(userText);
+    // --------------------------------
+    // WEBSOCKET ERROR
+    // --------------------------------
 
-      // --------------------------------
-      // STEP 2: Text → LLM
-      // --------------------------------
-
-      const chatResponse = await fetch(
-        "http://localhost:5000/api/chat",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            callId: callId,
-            message: userText,
-          }),
-        }
+    ws.onerror = (error) => {
+      console.error(
+        "WebSocket error:",
+        error
       );
 
-      const chatData = await chatResponse.json();
-
-      if (!chatResponse.ok) {
-        throw new Error(chatData.error || "AI response failed");
-      }
-
-      const aiText = chatData.reply;
-
-      setAiResponse(aiText);
-
-      // --------------------------------
-      // STEP 3: Text → Speech
-      // --------------------------------
-
-      const speechResponse = await fetch(
-        "http://localhost:5000/api/speak",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            text: aiText,
-          }),
-        }
+      setError(
+        "Realtime connection failed."
       );
 
-      if (!speechResponse.ok) {
-        const speechData = await speechResponse.json();
-
-        throw new Error(
-          speechData.error || "Speech generation failed"
-        );
-      }
-
-      const audioData = await speechResponse.blob();
-
-      const audioUrl = URL.createObjectURL(audioData);
-
-      const audio = new Audio(audioUrl);
-
-      await audio.play();
-
-      audio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
-      };
-    } catch (error) {
-      console.error("Processing error:", error);
-      setError(error.message);
-    } finally {
       setIsProcessing(false);
-    }
+    };
+
+
+    // --------------------------------
+    // WEBSOCKET CLOSED
+    // --------------------------------
+
+    ws.onclose = () => {
+      console.log(
+        "WebSocket disconnected"
+      );
+
+      setSocket(null);
+    };
+
+    return ws;
   };
 
 
-
-
-
+  // ==========================================
+  // START CALL
+  // ==========================================
 
   const startCall = async () => {
-  try {
-    setError("");
-    setTranscript("");
-    setAiResponse("");
-    setReport(null);
+    try {
+      setError("");
+      setTranscript("");
+      setAiResponse("");
+      setReport(null);
 
-    const response = await fetch(
-      "http://localhost:5000/api/call/start",
-      {
-        method: "POST",
+      const response =
+        await fetch(
+          "http://localhost:5000/api/call/start",
+          {
+            method: "POST",
+          }
+        );
+
+      const data =
+        await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.error ||
+            "Failed to start call"
+        );
       }
-    );
 
-    const data = await response.json();
+      setCallId(
+        data.callId
+      );
 
-    if (!response.ok) {
-      throw new Error(data.error || "Failed to start call");
+      connectWebSocket(
+        data.callId
+      );
+
+      setScreen("active");
+
+      console.log(
+        "Call started:",
+        data.callId
+      );
+
+    } catch (error) {
+      console.error(
+        "Start call error:",
+        error
+      );
+
+      setError(
+        error.message
+      );
     }
-
-    setCallId(data.callId);
-    setScreen("active");
-
-    console.log("Call started:", data.callId);
-  } catch (error) {
-    console.error("Start call error:", error);
-    setError(error.message);
-  }
-};
+  };
 
 
-const endCall = async () => {
-  try {
-    if (!callId) {
-      setError("No active call.");
-      return;
-    }
+  // ==========================================
+  // END CALL
+  // ==========================================
 
-    setError("");
+  const endCall = async () => {
+    try {
 
-    const response = await fetch(
-      `http://localhost:5000/api/call/${callId}/end`,
-      {
-        method: "POST",
+      if (!callId) {
+        setError(
+          "No active call."
+        );
+        return;
       }
-    );
 
-    const data = await response.json();
+      if (isRecording) {
+        setError(
+          "Please finish speaking before ending the call."
+        );
+        return;
+      }
 
-    if (!response.ok) {
-      throw new Error(data.error || "Failed to end call");
+      if (isProcessing) {
+        setError(
+          "Please wait for the AI to finish speaking."
+        );
+        return;
+      }
+
+      setError("");
+
+      // Close WebSocket
+      if (
+        socket &&
+        socket.readyState ===
+          WebSocket.OPEN
+      ) {
+        socket.close();
+      }
+
+      const response =
+        await fetch(
+          `http://localhost:5000/api/call/${callId}/end`,
+          {
+            method: "POST",
+          }
+        );
+
+      const data =
+        await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.error ||
+            "Failed to end call"
+        );
+      }
+
+      setReport(
+        data.report
+      );
+
+      setScreen("report");
+
+      setSocket(null);
+
+      console.log(
+        "Final report:",
+        data.report
+      );
+
+    } catch (error) {
+      console.error(
+        "End call error:",
+        error
+      );
+
+      setError(
+        error.message
+      );
     }
+  };
 
-    setReport(data.report);
-    setScreen("report");
 
-    console.log("Final report:", data.report);
+  // ==========================================
+  // UI
+  // ==========================================
 
-  } catch (error) {
-    console.error("End call error:", error);
-    setError(error.message);
-  }
-};
+  return (
+    <div className="app">
 
-return (
-  <div className="app">
-    <div className="container">
+      <div className="container">
 
-      {/* =========================
-          WELCOME SCREEN
-      ========================== */}
-      {screen === "welcome" && (
-        <div className="welcome-card">
+        {/* =========================
+            WELCOME SCREEN
+        ========================== */}
 
-          <div className="medical-icon">
-            🩺
-          </div>
+        {screen === "welcome" && (
+          <div className="welcome-card">
 
-          <h1>AI Health Screening</h1>
-
-          <p className="welcome-description">
-            Your voice-based health screening assistant
-          </p>
-
-          <button
-            className="primary-button"
-            onClick={startCall}
-          >
-            Start Call
-          </button>
-
-        </div>
-      )}
-
-      {/* =========================
-          ACTIVE CALL SCREEN
-      ========================== */}
-      {screen === "active" && (
-        <div className="active-card">
-
-          <div className="header">
-            <div className="small-icon">
+            <div className="medical-icon">
               🩺
             </div>
 
-            <h1>AI Health Screening</h1>
-          </div>
+            <h1>
+              AI Health Screening
+            </h1>
 
-          {/* Status */}
-          <div className="status-section">
-
-            <div className="status-icon">
-              {isRecording
-                ? "🎤"
-                : isProcessing
-                ? "🧠"
-                : "🔊"}
-            </div>
-
-            <h2>
-              {isRecording
-                ? "Listening..."
-                : isProcessing
-                ? "AI is thinking..."
-                : "Ready"}
-            </h2>
-
-          </div>
-
-          {/* User transcript */}
-          {transcript && (
-            <div className="conversation-card user-card">
-              <span className="conversation-label">
-                You said
-              </span>
-
-              <p>{transcript}</p>
-            </div>
-          )}
-
-          {/* AI response */}
-          {aiResponse && (
-            <div className="conversation-card ai-card">
-              <span className="conversation-label">
-                AI Assistant
-              </span>
-
-              <p>{aiResponse}</p>
-            </div>
-          )}
-
-          {/* Controls */}
-          <div className="controls">
+            <p className="welcome-description">
+              Your voice-based health
+              screening assistant
+            </p>
 
             <button
               className="primary-button"
-              onClick={startRecording}
-              disabled={isRecording || isProcessing}
+              onClick={startCall}
             >
-              🎤 Start Recording
-            </button>
-
-            <button
-              className="secondary-button"
-              onClick={stopRecording}
-              disabled={!isRecording}
-            >
-              Stop Recording
-            </button>
-
-            <button
-              className="end-call-button"
-              onClick={endCall}
-              disabled={isRecording || isProcessing}
-            >
-              🔴 End Call
+              Start Call
             </button>
 
           </div>
+        )}
 
-        </div>
-      )}
 
-      {/* =========================
-          REPORT SCREEN
-      ========================== */}
-      {screen === "report" && report && (
-        <div className="report-card">
+        {/* =========================
+            ACTIVE CALL SCREEN
+        ========================== */}
 
-          <div className="report-header">
+        {screen === "active" && (
+          <div className="active-card">
 
-            <div className="report-icon">
-              📋
+            <div className="header">
+
+              <div className="small-icon">
+                🩺
+              </div>
+
+              <h1>
+                AI Health Screening
+              </h1>
+
             </div>
 
-            <h1>Health Screening Report</h1>
 
-            <p>
-              Summary of your screening conversation
-            </p>
+            {/* STATUS */}
 
-          </div>
+            <div className="status-section">
 
-          {/* Summary */}
-          <div className="report-section">
-            <h3>Summary</h3>
-            <p>{report.summary}</p>
-          </div>
+              <div className="status-icon">
 
-          {/* Main Concern */}
-          <div className="report-section">
-            <h3>Main Concern</h3>
-            <p>{report.mainConcern}</p>
-          </div>
+                {isRecording
+                  ? "🎤"
+                  : isProcessing
+                  ? "🔊"
+                  : "💬"}
 
-          {/* Key Symptoms */}
-          <div className="report-section">
-            <h3>Key Symptoms</h3>
+              </div>
 
-            {report.keySymptoms.length > 0 ? (
-              <ul>
-                {report.keySymptoms.map((symptom, index) => (
-                  <li key={index}>
-                    {symptom}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p>Not provided</p>
+              <h2>
+
+                {isRecording
+                  ? "Listening..."
+                  : isProcessing
+                  ? "AI is speaking..."
+                  : "Ready"}
+
+              </h2>
+
+            </div>
+
+
+            {/* USER TRANSCRIPT */}
+
+            {transcript && (
+              <div className="conversation-card user-card">
+
+                <span className="conversation-label">
+                  You said
+                </span>
+
+                <p>
+                  {transcript}
+                </p>
+
+              </div>
             )}
-          </div>
 
-          {/* Duration */}
-          <div className="report-section">
-            <h3>Duration</h3>
-            <p>{report.duration}</p>
-          </div>
 
-          {/* Severity */}
-          <div className="report-section">
-            <h3>Severity</h3>
-            <p>{report.severity}</p>
-          </div>
+            {/* AI RESPONSE */}
 
-          {/* Follow-up */}
-          <div className="report-section">
-            <h3>Follow-up Items</h3>
+            {aiResponse && (
+              <div className="conversation-card ai-card">
 
-            {report.followUpItems.length > 0 ? (
-              <ul>
-                {report.followUpItems.map((item, index) => (
-                  <li key={index}>
-                    {item}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p>Not provided</p>
+                <span className="conversation-label">
+                  AI Assistant
+                </span>
+
+                <p>
+                  {aiResponse}
+                </p>
+
+              </div>
             )}
+
+
+            {/* CONTROLS */}
+
+            <div className="controls">
+
+              {/* SPEAK / DONE SPEAKING */}
+
+              <button
+                className={
+                  isRecording
+                    ? "speaking-button"
+                    : "primary-button"
+                }
+                onClick={
+                  isRecording
+                    ? stopRecording
+                    : startRecording
+                }
+                disabled={
+                  isProcessing
+                }
+              >
+                {isRecording
+                  ? "✓ Done Speaking"
+                  : "🎤 Speak"}
+              </button>
+
+
+              {/* END CALL */}
+
+              <button
+                className="end-call-button"
+                onClick={
+                  endCall
+                }
+                disabled={
+                  isRecording ||
+                  isProcessing
+                }
+              >
+                🔴 End Call
+              </button>
+
+            </div>
+
           </div>
+        )}
 
-          {/* New Screening */}
-          <button
-            className="primary-button new-screening-button"
-            onClick={() => {
-              setCallId(null);
-              setReport(null);
-              setTranscript("");
-              setAiResponse("");
-              setScreen("welcome");
-            }}
-          >
-            Start New Screening
-          </button>
 
-        </div>
-      )}
+        {/* =========================
+            REPORT SCREEN
+        ========================== */}
 
-      {/* =========================
-          ERROR
-      ========================== */}
-      {error && (
-        <div className="error-message">
-          Error: {error}
-        </div>
-      )}
+        {screen === "report" &&
+          report && (
+
+            <div className="report-card">
+
+              <div className="report-header">
+
+                <div className="report-icon">
+                  📋
+                </div>
+
+                <h1>
+                  Health Screening Report
+                </h1>
+
+                <p>
+                  Summary of your
+                  screening conversation
+                </p>
+
+              </div>
+
+
+              {/* SUMMARY */}
+
+              <div className="report-section">
+
+                <h3>
+                  Summary
+                </h3>
+
+                <p>
+                  {report.summary}
+                </p>
+
+              </div>
+
+
+              {/* MAIN CONCERN */}
+
+              <div className="report-section">
+
+                <h3>
+                  Main Concern
+                </h3>
+
+                <p>
+                  {report.mainConcern}
+                </p>
+
+              </div>
+
+
+              {/* KEY SYMPTOMS */}
+
+              <div className="report-section">
+
+                <h3>
+                  Key Symptoms
+                </h3>
+
+                {report.keySymptoms.length >
+                0 ? (
+                  <ul>
+
+                    {report.keySymptoms.map(
+                      (
+                        symptom,
+                        index
+                      ) => (
+                        <li
+                          key={index}
+                        >
+                          {symptom}
+                        </li>
+                      )
+                    )}
+
+                  </ul>
+                ) : (
+                  <p>
+                    Not provided
+                  </p>
+                )}
+
+              </div>
+
+
+              {/* DURATION */}
+
+              <div className="report-section">
+
+                <h3>
+                  Duration
+                </h3>
+
+                <p>
+                  {report.duration}
+                </p>
+
+              </div>
+
+
+              {/* SEVERITY */}
+
+              <div className="report-section">
+
+                <h3>
+                  Severity
+                </h3>
+
+                <p>
+                  {report.severity}
+                </p>
+
+              </div>
+
+
+              {/* FOLLOW-UP */}
+
+              <div className="report-section">
+
+                <h3>
+                  Follow-up Items
+                </h3>
+
+                {report.followUpItems.length >
+                0 ? (
+                  <ul>
+
+                    {report.followUpItems.map(
+                      (
+                        item,
+                        index
+                      ) => (
+                        <li
+                          key={index}
+                        >
+                          {item}
+                        </li>
+                      )
+                    )}
+
+                  </ul>
+                ) : (
+                  <p>
+                    Not provided
+                  </p>
+                )}
+
+              </div>
+
+
+              {/* NEW SCREENING */}
+
+              <button
+                className="primary-button new-screening-button"
+                onClick={() => {
+
+                  setCallId(null);
+                  setReport(null);
+                  setTranscript("");
+                  setAiResponse("");
+                  setSocket(null);
+                  setError("");
+                  setIsRecording(false);
+                  setIsProcessing(false);
+
+                  incomingAudioChunksRef.current =
+                    [];
+
+                  setScreen(
+                    "welcome"
+                  );
+
+                }}
+              >
+                Start New Screening
+              </button>
+
+            </div>
+          )}
+
+
+        {/* =========================
+            ERROR
+        ========================== */}
+
+        {error && (
+          <div className="error-message">
+            Error: {error}
+          </div>
+        )}
+
+      </div>
 
     </div>
-  </div>
-);
+  );
 }
 
 export default App;
