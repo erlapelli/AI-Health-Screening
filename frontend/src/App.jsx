@@ -1,5 +1,7 @@
 import { useRef, useState } from "react";
 import "./App.css";
+const API_URL = import.meta.env.VITE_API_URL;
+const WS_URL = import.meta.env.VITE_WS_URL;
 
 function App() {
   const [screen, setScreen] = useState("welcome");
@@ -148,7 +150,7 @@ function App() {
 
   const connectWebSocket = (callId) => {
     const ws = new WebSocket(
-      `ws://localhost:5000/ws?callId=${callId}`
+      `${WS_URL}/ws?callId=${callId}`
     );
 
     // --------------------------------
@@ -403,7 +405,7 @@ function App() {
 
       const response =
         await fetch(
-          "http://localhost:5000/api/call/start",
+          `${API_URL}/api/call/start`,
           {
             method: "POST",
           }
@@ -488,7 +490,7 @@ function App() {
 
       const response =
         await fetch(
-          `http://localhost:5000/api/call/${callId}/end`,
+          `${API_URL}/api/call/${callId}/end`,
           {
             method: "POST",
           }
